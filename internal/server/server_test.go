@@ -1,4 +1,4 @@
-package internal_test
+package server
 
 import (
 	"encoding/json"
