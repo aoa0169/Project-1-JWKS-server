@@ -1,8 +1,11 @@
 package server
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -17,8 +20,40 @@ func New(store *keys.Store) *Server {
 	return &Server{store: store}
 }
 
-// GET /jwks
-// Returns only non-expired public keys in JWKS format.
+type authRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+func validBasicAuth(r *http.Request) bool {
+	auth := r.Header.Get("Authorization")
+	if auth == "" {
+		return false
+	}
+
+	const prefix = "Basic "
+	if !strings.HasPrefix(auth, prefix) {
+		return false
+	}
+
+	raw := strings.TrimPrefix(auth, prefix)
+	decoded, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		return false
+	}
+
+	return strings.Contains(string(decoded), ":")
+}
+
+func validJSONAuth(r *http.Request) bool {
+	var req authRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		return false
+	}
+
+	return req.Username == "userABC" && req.Password == "password123"
+}
+
 func (s *Server) HandleJWKS(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -26,65 +61,83 @@ func (s *Server) HandleJWKS(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
-	active := s.store.ActiveKeys(now)
+	active, err := s.store.ActiveKeys(now)
+	if err != nil {
+		http.Error(w, "failed to read keys", http.StatusInternalServerError)
+		return
+	}
+
 	jwks := keys.ToJWKS(active)
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(jwks)
 }
 
-// POST /auth
-// If ?expired is present, sign with an expired key and set exp to that expired time.
 func (s *Server) HandleAuth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	now := time.Now().UTC()
+	authorized := false
 
-	issueExpired := r.URL.Query().Has("expired")
-
-	var key keys.KeyRecord
-	var ok bool
-
-	if issueExpired {
-		key, ok = s.store.ExpiredKey(now)
-		if !ok {
-			http.Error(w, "no expired key available", http.StatusInternalServerError)
-			return
-		}
-	} else {
-		key, ok = s.store.CurrentSigningKey(now)
-		if !ok {
-			http.Error(w, "no active key available", http.StatusInternalServerError)
-			return
-		}
+	if validBasicAuth(r) {
+		authorized = true
+	} else if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		authorized = validJSONAuth(r)
 	}
 
-	// exp: normal token expires in 5 minutes OR expired token uses the expired key's expiry
+	if !authorized {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	now := time.Now().UTC()
+	useExpired := r.URL.Query().Has("expired")
+
+	var (
+		keyRecord keys.KeyRecord
+		ok        bool
+		err       error
+	)
+
+	if useExpired {
+		keyRecord, ok, err = s.store.GetExpiredKey(now)
+	} else {
+		keyRecord, ok, err = s.store.GetValidKey(now)
+	}
+
+	if err != nil {
+		http.Error(w, "failed to read signing key", http.StatusInternalServerError)
+		return
+	}
+
+	if !ok {
+		http.Error(w, "no matching key found", http.StatusInternalServerError)
+		return
+	}
+
 	exp := now.Add(5 * time.Minute)
-	if issueExpired {
-		exp = key.Expiry // already in the past
+	if useExpired {
+		exp = keyRecord.Expiry
 	}
 
 	claims := jwt.MapClaims{
-		"sub": "fake-user",
+		"sub": "userABC",
 		"iss": "jwks-server",
 		"iat": now.Unix(),
 		"exp": exp.Unix(),
 	}
 
-	tok := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	tok.Header["kid"] = key.KID
+	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
+	token.Header["kid"] = strconv.FormatInt(keyRecord.KID, 10)
 
-	signed, err := tok.SignedString(key.Priv)
+	signed, err := token.SignedString(keyRecord.Priv)
 	if err != nil {
-		http.Error(w, "failed to sign token", http.StatusInternalServerError)
+		http.Error(w, "failed to sign jwt", http.StatusInternalServerError)
 		return
 	}
 
-	// Return as plain text JWT (simple for the blackbox client)
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(signed))
