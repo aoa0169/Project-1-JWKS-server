@@ -4,6 +4,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"math/big"
+	"strconv"
 )
 
 type JWKS struct {
@@ -11,12 +12,12 @@ type JWKS struct {
 }
 
 type JWK struct {
-	Kty string `json:"kty"` // RSA
-	Use string `json:"use"` // sig
-	Alg string `json:"alg"` // RS256
-	Kid string `json:"kid"` // key id
-	N   string `json:"n"`   // modulus
-	E   string `json:"e"`   // exponent
+	Kty string `json:"kty"`
+	Use string `json:"use"`
+	Alg string `json:"alg"`
+	Kid string `json:"kid"`
+	N   string `json:"n"`
+	E   string `json:"e"`
 }
 
 func ToJWKS(active []KeyRecord) JWKS {
@@ -27,12 +28,12 @@ func ToJWKS(active []KeyRecord) JWKS {
 	return out
 }
 
-func RSAJWK(kid string, pub *rsa.PublicKey) JWK {
+func RSAJWK(kid int64, pub *rsa.PublicKey) JWK {
 	return JWK{
 		Kty: "RSA",
 		Use: "sig",
 		Alg: "RS256",
-		Kid: kid,
+		Kid: strconv.FormatInt(kid, 10),
 		N:   base64.RawURLEncoding.EncodeToString(pub.N.Bytes()),
 		E:   base64.RawURLEncoding.EncodeToString(big.NewInt(int64(pub.E)).Bytes()),
 	}
