@@ -59,35 +59,36 @@ func NewStore(dbPath string) (*Store, error) {
 
 func (s *Store) init() error {
 	_, err := s.db.Exec(`
-		CREATE TABLE IF NOT EXISTS keys(
-			kid INTEGER PRIMARY KEY AUTOINCREMENT,
-			key BLOB NOT NULL,
-			iv BLOB NOT NULL,
-			exp INTEGER NOT NULL
-		);
+	CREATE TABLE IF NOT EXISTS keys(
+		kid INTEGER PRIMARY KEY AUTOINCREMENT,
+		key BLOB NOT NULL,
+		exp INTEGER NOT NULL
+	);
 
-		CREATE TABLE IF NOT EXISTS users(
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			username TEXT NOT NULL UNIQUE,
-			password_hash TEXT NOT NULL,
-			email TEXT UNIQUE,
-			date_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			last_login TIMESTAMP
-		);
+	CREATE TABLE IF NOT EXISTS users(
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		username TEXT NOT NULL UNIQUE,
+		password_hash TEXT NOT NULL,
+		email TEXT UNIQUE,
+		date_registered TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		last_login TIMESTAMP
+	);
 
-		CREATE TABLE IF NOT EXISTS auth_logs(
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			request_ip TEXT NOT NULL,
-			request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-			user_id INTEGER,
-			FOREIGN KEY(user_id) REFERENCES users(id)
-		);
+	CREATE TABLE IF NOT EXISTS auth_logs(
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		request_ip TEXT NOT NULL,
+		request_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+		user_id INTEGER,
+		FOREIGN KEY(user_id) REFERENCES users(id)
+	);
 	`)
+
 	return err
 }
 
 func (s *Store) seedIfNeeded() error {
 	var count int
+
 	err := s.db.QueryRow(`SELECT COUNT(*) FROM keys`).Scan(&count)
 	if err != nil {
 		return err
@@ -135,36 +136,38 @@ func aesKeyFromEnv() ([]byte, error) {
 	if secret == "" {
 		return nil, errors.New("NOT_MY_KEY environment variable is required")
 	}
+
 	hash := sha256.Sum256([]byte(secret))
 	return hash[:], nil
 }
 
-func encryptPrivateKey(plain []byte) ([]byte, []byte, error) {
+func encryptPrivateKey(plain []byte) ([]byte, error) {
 	key, err := aesKeyFromEnv()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	iv := make([]byte, gcm.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	ciphertext := gcm.Seal(nil, iv, plain, nil)
-	return ciphertext, iv, nil
+
+	return append(iv, ciphertext...), nil
 }
 
-func decryptPrivateKey(ciphertext []byte, iv []byte) ([]byte, error) {
+func decryptPrivateKey(encrypted []byte) ([]byte, error) {
 	key, err := aesKeyFromEnv()
 	if err != nil {
 		return nil, err
@@ -179,28 +182,36 @@ func decryptPrivateKey(ciphertext []byte, iv []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	nonceSize := gcm.NonceSize()
+	if len(encrypted) < nonceSize {
+		return nil, errors.New("encrypted private key too short")
+	}
+
+	iv := encrypted[:nonceSize]
+	ciphertext := encrypted[nonceSize:]
 
 	return gcm.Open(nil, iv, ciphertext, nil)
 }
 
 func (s *Store) InsertKey(privateKeyPEM []byte, exp time.Time) error {
-	encrypted, iv, err := encryptPrivateKey(privateKeyPEM)
+	encrypted, err := encryptPrivateKey(privateKeyPEM)
 	if err != nil {
 		return err
 	}
 
 	_, err = s.db.Exec(
-		`INSERT INTO keys (key, iv, exp) VALUES (?, ?, ?)`,
+		`INSERT INTO keys (key, exp) VALUES (?, ?)`,
 		encrypted,
-		iv,
 		exp.UTC().Unix(),
 	)
+
 	return err
 }
 
 func (s *Store) GetValidKey(now time.Time) (KeyRecord, bool, error) {
 	row := s.db.QueryRow(
-		`SELECT kid, key, iv, exp FROM keys WHERE exp > ? ORDER BY exp DESC LIMIT 1`,
+		`SELECT kid, key, exp FROM keys WHERE exp > ? ORDER BY exp DESC LIMIT 1`,
 		now.UTC().Unix(),
 	)
 
@@ -209,7 +220,7 @@ func (s *Store) GetValidKey(now time.Time) (KeyRecord, bool, error) {
 
 func (s *Store) GetExpiredKey(now time.Time) (KeyRecord, bool, error) {
 	row := s.db.QueryRow(
-		`SELECT kid, key, iv, exp FROM keys WHERE exp <= ? ORDER BY exp ASC LIMIT 1`,
+		`SELECT kid, key, exp FROM keys WHERE exp <= ? ORDER BY exp ASC LIMIT 1`,
 		now.UTC().Unix(),
 	)
 
@@ -219,18 +230,18 @@ func (s *Store) GetExpiredKey(now time.Time) (KeyRecord, bool, error) {
 func (s *Store) scanKey(row *sql.Row) (KeyRecord, bool, error) {
 	var kid int64
 	var encrypted []byte
-	var iv []byte
 	var expUnix int64
 
-	err := row.Scan(&kid, &encrypted, &iv, &expUnix)
+	err := row.Scan(&kid, &encrypted, &expUnix)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return KeyRecord{}, false, nil
 		}
+
 		return KeyRecord{}, false, err
 	}
 
-	pemBytes, err := decryptPrivateKey(encrypted, iv)
+	pemBytes, err := decryptPrivateKey(encrypted)
 	if err != nil {
 		return KeyRecord{}, false, err
 	}
@@ -249,7 +260,7 @@ func (s *Store) scanKey(row *sql.Row) (KeyRecord, bool, error) {
 
 func (s *Store) ActiveKeys(now time.Time) ([]KeyRecord, error) {
 	rows, err := s.db.Query(
-		`SELECT kid, key, iv, exp FROM keys WHERE exp > ? ORDER BY kid`,
+		`SELECT kid, key, exp FROM keys WHERE exp > ? ORDER BY kid`,
 		now.UTC().Unix(),
 	)
 	if err != nil {
@@ -262,14 +273,13 @@ func (s *Store) ActiveKeys(now time.Time) ([]KeyRecord, error) {
 	for rows.Next() {
 		var kid int64
 		var encrypted []byte
-		var iv []byte
 		var expUnix int64
 
-		if err := rows.Scan(&kid, &encrypted, &iv, &expUnix); err != nil {
+		if err := rows.Scan(&kid, &encrypted, &expUnix); err != nil {
 			return nil, err
 		}
 
-		pemBytes, err := decryptPrivateKey(encrypted, iv)
+		pemBytes, err := decryptPrivateKey(encrypted)
 		if err != nil {
 			return nil, err
 		}
@@ -300,7 +310,9 @@ func HashPassword(password string) (string, error) {
 	}
 
 	hash := argon2.IDKey([]byte(password), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
-	return fmt.Sprintf("$argon2id$v=19$t=%d,m=%d,p=%d$%s$%s",
+
+	return fmt.Sprintf(
+		"$argon2id$v=19$t=%d,m=%d,p=%d$%s$%s",
 		argonTime,
 		argonMemory,
 		argonThreads,
@@ -318,6 +330,7 @@ func VerifyPassword(password, encodedHash string) bool {
 	var timeCost uint32
 	var memoryCost uint32
 	var threads uint8
+
 	if _, err := fmt.Sscanf(parts[3], "t=%d,m=%d,p=%d", &timeCost, &memoryCost, &threads); err != nil {
 		return false
 	}
@@ -333,6 +346,7 @@ func VerifyPassword(password, encodedHash string) bool {
 	}
 
 	actual := argon2.IDKey([]byte(password), salt, timeCost, memoryCost, threads, uint32(len(expected)))
+
 	if len(actual) != len(expected) {
 		return false
 	}
@@ -341,6 +355,7 @@ func VerifyPassword(password, encodedHash string) bool {
 	for i := range actual {
 		diff |= actual[i] ^ expected[i]
 	}
+
 	return diff == 0
 }
 
@@ -356,18 +371,24 @@ func (s *Store) CreateUser(username, email, password string) error {
 		passwordHash,
 		email,
 	)
+
 	return err
 }
 
 func (s *Store) AuthenticateUser(username, password string) (UserRecord, bool, error) {
-	row := s.db.QueryRow(`SELECT id, username, email, password_hash FROM users WHERE username = ?`, username)
+	row := s.db.QueryRow(
+		`SELECT id, username, email, password_hash FROM users WHERE username = ?`,
+		username,
+	)
 
 	var user UserRecord
 	var passwordHash string
+
 	if err := row.Scan(&user.ID, &user.Username, &user.Email, &passwordHash); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return UserRecord{}, false, nil
 		}
+
 		return UserRecord{}, false, err
 	}
 
@@ -376,17 +397,23 @@ func (s *Store) AuthenticateUser(username, password string) (UserRecord, bool, e
 	}
 
 	_, _ = s.db.Exec(`UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?`, user.ID)
+
 	return user, true, nil
 }
 
 func (s *Store) FindUserByUsername(username string) (UserRecord, bool, error) {
-	row := s.db.QueryRow(`SELECT id, username, COALESCE(email, '') FROM users WHERE username = ?`, username)
+	row := s.db.QueryRow(
+		`SELECT id, username, COALESCE(email, '') FROM users WHERE username = ?`,
+		username,
+	)
 
 	var user UserRecord
+
 	if err := row.Scan(&user.ID, &user.Username, &user.Email); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return UserRecord{}, false, nil
 		}
+
 		return UserRecord{}, false, err
 	}
 
@@ -395,11 +422,20 @@ func (s *Store) FindUserByUsername(username string) (UserRecord, bool, error) {
 
 func (s *Store) LogAuthRequest(requestIP string, userID *int64) error {
 	if userID == nil {
-		_, err := s.db.Exec(`INSERT INTO auth_logs(request_ip, user_id) VALUES (?, NULL)`, requestIP)
+		_, err := s.db.Exec(
+			`INSERT INTO auth_logs(request_ip, user_id) VALUES (?, NULL)`,
+			requestIP,
+		)
+
 		return err
 	}
 
-	_, err := s.db.Exec(`INSERT INTO auth_logs(request_ip, user_id) VALUES (?, ?)`, requestIP, *userID)
+	_, err := s.db.Exec(
+		`INSERT INTO auth_logs(request_ip, user_id) VALUES (?, ?)`,
+		requestIP,
+		*userID,
+	)
+
 	return err
 }
 
@@ -407,5 +443,6 @@ func (s *Store) Close() error {
 	if s.db != nil {
 		return s.db.Close()
 	}
+
 	return nil
 }
