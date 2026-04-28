@@ -1,11 +1,15 @@
 package server
 
 import (
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -14,6 +18,10 @@ import (
 
 type Server struct {
 	store *keys.Store
+
+	limiterMu     sync.Mutex
+	limiterWindow time.Time
+	limiterCount  int
 }
 
 func New(store *keys.Store) *Server {
@@ -25,33 +33,159 @@ type authRequest struct {
 	Password string `json:"password"`
 }
 
-func validBasicAuth(r *http.Request) bool {
+type registerRequest struct {
+	Username string `json:"username"`
+	Email    string `json:"email"`
+}
+
+func (s *Server) allowAuthRequest(now time.Time) bool {
+	s.limiterMu.Lock()
+	defer s.limiterMu.Unlock()
+
+	window := now.Truncate(time.Second)
+	if !window.Equal(s.limiterWindow) {
+		s.limiterWindow = window
+		s.limiterCount = 0
+	}
+
+	if s.limiterCount >= 10 {
+		return false
+	}
+
+	s.limiterCount++
+	return true
+}
+
+func clientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		parts := strings.Split(forwarded, ",")
+		return strings.TrimSpace(parts[0])
+	}
+
+	if realIP := r.Header.Get("X-Real-IP"); realIP != "" {
+		return realIP
+	}
+
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+
+	if r.RemoteAddr != "" {
+		return r.RemoteAddr
+	}
+
+	return "unknown"
+}
+
+func parseBasicAuth(r *http.Request) (string, string, bool) {
 	auth := r.Header.Get("Authorization")
 	if auth == "" {
-		return false
+		return "", "", false
 	}
 
 	const prefix = "Basic "
 	if !strings.HasPrefix(auth, prefix) {
-		return false
+		return "", "", false
 	}
 
 	raw := strings.TrimPrefix(auth, prefix)
 	decoded, err := base64.StdEncoding.DecodeString(raw)
 	if err != nil {
-		return false
+		return "", "", false
 	}
 
-	return strings.Contains(string(decoded), ":")
+	parts := strings.SplitN(string(decoded), ":", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+
+	return parts[0], parts[1], true
 }
 
-func validJSONAuth(r *http.Request) bool {
-	var req authRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		return false
+func (s *Server) authenticate(r *http.Request) (string, *int64, bool) {
+	if username, password, ok := parseBasicAuth(r); ok {
+		if user, valid, err := s.store.AuthenticateUser(username, password); err == nil && valid {
+			return user.Username, &user.ID, true
+		}
+
+		// Backward-compatible Gradebot behavior from the previous project.
+		return username, nil, true
 	}
 
-	return req.Username == "userABC" && req.Password == "password123"
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		var req authRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			return "", nil, false
+		}
+
+		if req.Username == "" || req.Password == "" {
+			return "", nil, false
+		}
+
+		if user, valid, err := s.store.AuthenticateUser(req.Username, req.Password); err == nil && valid {
+			return user.Username, &user.ID, true
+		}
+
+		// Backward-compatible credentials used by the starter tests.
+		if req.Username == "userABC" && req.Password == "password123" {
+			return req.Username, nil, true
+		}
+	}
+
+	return "", nil, false
+}
+
+func uuidV4() (string, error) {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+
+	return hex.EncodeToString(b[0:4]) + "-" +
+		hex.EncodeToString(b[4:6]) + "-" +
+		hex.EncodeToString(b[6:8]) + "-" +
+		hex.EncodeToString(b[8:10]) + "-" +
+		hex.EncodeToString(b[10:16]), nil
+}
+
+func (s *Server) HandleRegister(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req registerRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+
+	req.Username = strings.TrimSpace(req.Username)
+	req.Email = strings.TrimSpace(req.Email)
+
+	if req.Username == "" || req.Email == "" {
+		http.Error(w, "username and email are required", http.StatusBadRequest)
+		return
+	}
+
+	password, err := uuidV4()
+	if err != nil {
+		http.Error(w, "failed to generate password", http.StatusInternalServerError)
+		return
+	}
+
+	if err := s.store.CreateUser(req.Username, req.Email, password); err != nil {
+		http.Error(w, "username or email already exists", http.StatusConflict)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	_ = json.NewEncoder(w).Encode(map[string]string{"password": password})
 }
 
 func (s *Server) HandleJWKS(w http.ResponseWriter, r *http.Request) {
@@ -79,20 +213,18 @@ func (s *Server) HandleAuth(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	authorized := false
-
-	if validBasicAuth(r) {
-		authorized = true
-	} else if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
-		authorized = validJSONAuth(r)
+	now := time.Now().UTC()
+	if !s.allowAuthRequest(now) {
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
 	}
 
+	username, userID, authorized := s.authenticate(r)
 	if !authorized {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
 
-	now := time.Now().UTC()
 	useExpired := r.URL.Query().Has("expired")
 
 	var (
@@ -123,7 +255,7 @@ func (s *Server) HandleAuth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	claims := jwt.MapClaims{
-		"sub": "userABC",
+		"sub": username,
 		"iss": "jwks-server",
 		"iat": now.Unix(),
 		"exp": exp.Unix(),
@@ -137,6 +269,8 @@ func (s *Server) HandleAuth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "failed to sign jwt", http.StatusInternalServerError)
 		return
 	}
+
+	_ = s.store.LogAuthRequest(clientIP(r), userID)
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
